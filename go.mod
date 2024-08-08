@@ -1,3 +1,3 @@
-module gitlab.com/etke.cc/go/psd
+module github.com/etkecc/go-psd
 
 go 1.21.0

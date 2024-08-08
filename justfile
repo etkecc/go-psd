@@ -17,6 +17,6 @@ lintfix:
 
 # run unit tests
 test:
-    @go test -coverprofile=cover.out ./...
+    @go test -cover -coverprofile=cover.out -coverpkg=./... -covermode=set ./...
     @go tool cover -func=cover.out
     -@rm -f cover.out
