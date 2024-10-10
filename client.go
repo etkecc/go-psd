@@ -52,12 +52,16 @@ func NewClient(baseURL, login, password string) *Client {
 }
 
 // GetWithContext returns the list of targets for the given identifier using the given context
-func (p *Client) GetWithContext(ctx context.Context, identifier string) ([]*Target, error) {
+func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverride ...string) ([]*Target, error) {
 	if p.url == nil {
 		return nil, nil
 	}
 	cloned := *p.url
-	uri := cloned.JoinPath("/node/" + identifier)
+	job := "node"
+	if len(jobOverride) > 0 {
+		job = jobOverride[0]
+	}
+	uri := cloned.JoinPath("/" + job + "/" + identifier)
 	urlTarget := uri.String()
 	cachedData, cached := p.cache.Get(urlTarget)
 
