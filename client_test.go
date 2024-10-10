@@ -41,7 +41,7 @@ func TestGetWithContext_CacheMiss(t *testing.T) {
 		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
 		w.Header().Set("ETag", `"mock-etag"`)
 		w.WriteHeader(http.StatusOK)
-		w.Write(mockData)
+		w.Write(mockData) //nolint:errcheck // test
 	}))
 	defer ts.Close()
 
