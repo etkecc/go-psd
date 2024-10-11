@@ -57,7 +57,7 @@ func NewClient(baseURL, login, password string, userAgentOverride ...string) *Cl
 }
 
 // GetWithContext returns the list of targets for the given identifier using the given context
-func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverride ...string) ([]*Target, error) {
+func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverride ...string) (Items, error) {
 	if p.url == nil {
 		return nil, nil
 	}
@@ -117,7 +117,7 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 			cachedAt: lastModified,
 		})
 	}
-	var psd []*Target
+	var psd []*Item
 	err = json.Unmarshal(datab, &psd)
 	if err != nil {
 		return nil, err
@@ -127,6 +127,6 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 }
 
 // Get returns the list of targets for the given identifier
-func (p *Client) Get(identifier string) ([]*Target, error) {
+func (p *Client) Get(identifier string) (Items, error) {
 	return p.GetWithContext(context.Background(), identifier)
 }

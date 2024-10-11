@@ -12,7 +12,7 @@ import (
 // Helper function to create mock data
 func createMockData(t *testing.T) []byte {
 	t.Helper()
-	targets := []*Target{
+	targets := []*Item{
 		{Targets: []string{"target1"}, Labels: map[string]string{"domain": "example.com"}},
 		{Targets: []string{"target2"}, Labels: map[string]string{"domain": "example.net"}},
 	}
@@ -137,7 +137,7 @@ func TestNewClient_InvalidURL(t *testing.T) {
 }
 
 func TestGetDomain(t *testing.T) {
-	target := &Target{Targets: []string{"target1"}, Labels: map[string]string{"domain": "example.com"}}
+	target := &Item{Targets: []string{"target1"}, Labels: map[string]string{"domain": "example.com"}}
 	if target.GetDomain() != "example.com" {
 		t.Fatal("Expected domain to be example.com")
 	}
