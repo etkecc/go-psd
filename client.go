@@ -7,28 +7,21 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"runtime/debug"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-var version = func() string {
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				return setting.Value
-			}
-		}
-	}
-	return "0.0.0-unknown"
-}()
+// DefaultUserAgent is the default user agent used by the client
+const DefaultUserAgent = "Go-PSD-client/v0.0.0"
 
+// Client is the client to interact with the Prometheus Service Discovery HTTP API
 type Client struct {
-	url      *url.URL
-	cache    *lru.Cache[string, cacheValue]
-	login    string
-	password string
+	url       *url.URL
+	cache     *lru.Cache[string, cacheValue]
+	login     string
+	password  string
+	userAgent string
 }
 
 type cacheValue struct {
@@ -38,17 +31,29 @@ type cacheValue struct {
 }
 
 // NewClient returns a new PSD client
-func NewClient(baseURL, login, password string) *Client {
+func NewClient(baseURL, login, password string, userAgentOverride ...string) *Client {
 	uri, err := url.Parse(baseURL)
 	if err != nil || login == "" || password == "" {
 		return &Client{}
 	}
+
 	cache, err := lru.New[string, cacheValue](1000)
 	if err != nil {
 		return &Client{}
 	}
 
-	return &Client{url: uri, login: login, password: password, cache: cache}
+	userAgent := DefaultUserAgent
+	if len(userAgentOverride) > 0 {
+		userAgent = userAgentOverride[0]
+	}
+
+	return &Client{
+		url:       uri,
+		cache:     cache,
+		login:     login,
+		password:  password,
+		userAgent: userAgent,
+	}
 }
 
 // GetWithContext returns the list of targets for the given identifier using the given context
@@ -80,7 +85,7 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 		}
 	}
 
-	req.Header.Set("User-Agent", "Go-PSD-client/"+version)
+	req.Header.Set("User-Agent", p.userAgent)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
