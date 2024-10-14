@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // DefaultUserAgent is the default user agent used by the client
@@ -18,7 +18,7 @@ const DefaultUserAgent = "Go-PSD-client/v0.0.0"
 // Client is the client to interact with the Prometheus Service Discovery HTTP API
 type Client struct {
 	url       *url.URL
-	cache     *lru.Cache[string, cacheValue]
+	cache     *expirable.LRU[string, cacheValue]
 	login     string
 	password  string
 	userAgent string
@@ -37,11 +37,7 @@ func NewClient(baseURL, login, password string, userAgentOverride ...string) *Cl
 		return &Client{}
 	}
 
-	cache, err := lru.New[string, cacheValue](1000)
-	if err != nil {
-		return &Client{}
-	}
-
+	cache := expirable.NewLRU[string, cacheValue](1000, nil, 5*time.Minute)
 	userAgent := DefaultUserAgent
 	if len(userAgentOverride) > 0 {
 		userAgent = userAgentOverride[0]
@@ -80,9 +76,7 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 	req.SetBasicAuth(p.login, p.password)
 	if cached {
 		req.Header.Set("If-Modified-Since", cachedData.cachedAt)
-		if cachedData.etag != "" {
-			req.Header.Set("If-None-Match", cachedData.etag)
-		}
+		req.Header.Set("If-None-Match", cachedData.etag)
 	}
 
 	req.Header.Set("User-Agent", p.userAgent)
