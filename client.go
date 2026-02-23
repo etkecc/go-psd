@@ -75,7 +75,7 @@ func (p *Client) do(ctx context.Context, makeReq func(context.Context) (*http.Re
 		return nil, err
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Do(req) //nolint:gosec // The URL is built from a trusted source
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, nil
