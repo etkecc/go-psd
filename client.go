@@ -84,12 +84,12 @@ func (p *Client) do(ctx context.Context, makeReq func(context.Context) (*http.Re
 	}
 
 	if resp.StatusCode == http.StatusGone { // not found, to distinguish from reverse proxy 404 error
-		defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+		defer resp.Body.Close()
 		return nil, nil
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotModified {
-		defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+		defer resp.Body.Close()
 		if attempt < p.maxRetries {
 			time.Sleep(1 * time.Second * time.Duration(attempt+1)) // Exponential backoff
 			return p.do(ctx, makeReq, attempt+1)
@@ -140,7 +140,7 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 		return nil, nil
 	}
 
-	defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+	defer resp.Body.Close()
 	var datab []byte
 	if resp.StatusCode == http.StatusNotModified && cached {
 		datab = cachedData.data
@@ -208,7 +208,7 @@ func (p *Client) GetRaw(ctx context.Context, identifier string, jobOverride ...s
 	if resp == nil {
 		return nil, nil
 	}
-	defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+	defer resp.Body.Close()
 
 	return io.ReadAll(resp.Body)
 }

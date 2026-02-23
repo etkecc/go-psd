@@ -18,7 +18,10 @@ func createMockData(t *testing.T) []byte {
 		{Targets: []string{"target1"}, Labels: map[string]string{"domain": "example.com"}},
 		{Targets: []string{"target2"}, Labels: map[string]string{"domain": "example.net"}},
 	}
-	data, _ := json.Marshal(targets)
+	data, err := json.Marshal(targets)
+	if err != nil {
+		t.Fatalf("Failed to marshal mock data: %v", err)
+	}
 	return data
 }
 
@@ -39,11 +42,11 @@ func TestNewClient(t *testing.T) {
 // Test GetWithContext with a valid response and cache miss
 func TestGetWithContext_CacheMiss(t *testing.T) {
 	mockData := createMockData(t)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
 		w.Header().Set("ETag", `"mock-etag"`)
 		w.WriteHeader(http.StatusOK)
-		w.Write(mockData) //nolint:errcheck // test
+		w.Write(mockData)
 	}))
 	defer ts.Close()
 
@@ -104,7 +107,7 @@ func TestGetWithContext_CacheHit(t *testing.T) {
 
 // Test GetWithContext with a 404 error response
 func TestGetWithContext_NotFound(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusGone)
 	}))
 	defer ts.Close()
@@ -118,7 +121,7 @@ func TestGetWithContext_NotFound(t *testing.T) {
 
 // Test GetWithContext with a server error
 func TestGetWithContext_ServerError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer ts.Close()
@@ -174,7 +177,7 @@ func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
 		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
 		w.Header().Set("ETag", `"mock-etag"`)
 		w.WriteHeader(http.StatusOK)
-		w.Write(createMockData(t)) //nolint:errcheck // test
+		w.Write(createMockData(t))
 	}))
 	defer ts.Close()
 
@@ -189,7 +192,7 @@ func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
 		t.Fatalf("Expected %d calls, got %d", failUntil+1, got)
 	}
 	if msg := headerErr.Load(); msg != nil {
-		t.Fatal(msg.(string))
+		t.Fatal(msg)
 	}
 }
 
@@ -197,7 +200,7 @@ func TestGetWithContext_RetryLimitExceeded(t *testing.T) {
 	var calls int32
 	userAgent := "test-ua"
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
