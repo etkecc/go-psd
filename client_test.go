@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -140,5 +142,75 @@ func TestGetDomain(t *testing.T) {
 	target := &Item{Targets: []string{"target1"}, Labels: map[string]string{"domain": "example.com"}}
 	if target.GetDomain() != "example.com" {
 		t.Fatal("Expected domain to be example.com")
+	}
+}
+
+func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
+	var calls int32
+	failUntil := int32(2)
+	userAgent := "test-ua"
+	var headerErr atomic.Value
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+
+		if got := r.Header.Get("User-Agent"); got != userAgent {
+			if headerErr.Load() == nil {
+				headerErr.Store("User-Agent mismatch: got " + got + ", want " + userAgent)
+			}
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "user" || pass != "password" {
+			if headerErr.Load() == nil {
+				headerErr.Store("BasicAuth mismatch: got (" + user + ", " + pass + "), ok=" + strconv.FormatBool(ok))
+			}
+		}
+
+		if atomic.LoadInt32(&calls) <= failUntil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
+		w.Header().Set("ETag", `"mock-etag"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write(createMockData(t)) //nolint:errcheck // test
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password", userAgent)
+	client.maxRetries = int(failUntil)
+
+	_, err := client.Get("test-id")
+	if err != nil {
+		t.Fatalf("Expected no error after retries, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != failUntil+1 {
+		t.Fatalf("Expected %d calls, got %d", failUntil+1, got)
+	}
+	if msg := headerErr.Load(); msg != nil {
+		t.Fatal(msg.(string))
+	}
+}
+
+func TestGetWithContext_RetryLimitExceeded(t *testing.T) {
+	var calls int32
+	userAgent := "test-ua"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password", userAgent)
+	client.maxRetries = 1
+
+	_, err := client.Get("test-id")
+	if err == nil || !strings.Contains(err.Error(), "HTTP error: 500 Internal Server Error") {
+		t.Fatalf("Expected HTTP 500 error after retries, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != int32(client.maxRetries)+1 {
+		t.Fatalf("Expected %d calls, got %d", client.maxRetries+1, got)
 	}
 }

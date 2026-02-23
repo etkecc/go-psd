@@ -3,6 +3,7 @@ package psd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,16 +13,22 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
-// DefaultUserAgent is the default user agent used by the client
-const DefaultUserAgent = "Go-PSD-client/v0.0.0"
+const (
+	// DefaultUserAgent is the default user agent used by the client
+	DefaultUserAgent = "Go-PSD-client/v0.0.0"
+	// DefaultMaxRetries is the default number of retries for failed requests
+	DefaultMaxRetries = 3
+)
 
 // Client is the client to interact with the Prometheus Service Discovery HTTP API
 type Client struct {
-	url       *url.URL
-	cache     *expirable.LRU[string, cacheValue]
-	login     string
-	password  string
-	userAgent string
+	url        *url.URL
+	cache      *expirable.LRU[string, cacheValue]
+	client     *http.Client
+	login      string
+	password   string
+	userAgent  string
+	maxRetries int
 }
 
 type cacheValue struct {
@@ -34,7 +41,7 @@ type cacheValue struct {
 func NewClient(baseURL, login, password string, userAgentOverride ...string) *Client {
 	uri, err := url.Parse(baseURL)
 	if err != nil || login == "" || password == "" {
-		return &Client{}
+		return &Client{client: http.DefaultClient}
 	}
 
 	cache := expirable.NewLRU[string, cacheValue](1000, nil, 5*time.Minute)
@@ -44,12 +51,54 @@ func NewClient(baseURL, login, password string, userAgentOverride ...string) *Cl
 	}
 
 	return &Client{
-		url:       uri,
-		cache:     cache,
-		login:     login,
-		password:  password,
-		userAgent: userAgent,
+		url:        uri,
+		cache:      cache,
+		client:     http.DefaultClient,
+		login:      login,
+		password:   password,
+		userAgent:  userAgent,
+		maxRetries: DefaultMaxRetries,
 	}
+}
+
+// do executes an HTTP request with per-attempt timeout and retry handling.
+func (p *Client) do(ctx context.Context, makeReq func(context.Context) (*http.Request, error), currentAttempt ...int) (*http.Response, error) {
+	attempt := 0
+	if len(currentAttempt) > 0 {
+		attempt = currentAttempt[0]
+	}
+
+	childCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := makeReq(childCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusGone { // not found, to distinguish from reverse proxy 404 error
+		defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+		return nil, nil
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotModified {
+		defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
+		if attempt < p.maxRetries {
+			time.Sleep(1 * time.Second * time.Duration(attempt+1)) // Exponential backoff
+			return p.do(ctx, makeReq, attempt+1)
+		}
+		err = fmt.Errorf("HTTP error: %s", resp.Status)
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // GetWithContext returns the list of targets for the given identifier using the given context
@@ -66,33 +115,35 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 	urlTarget := uri.String()
 	cachedData, cached := p.cache.Get(urlTarget)
 
-	childCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(childCtx, http.MethodGet, urlTarget, http.NoBody)
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(p.login, p.password)
+	headers := http.Header{}
 	if cached {
-		req.Header.Set("If-Modified-Since", cachedData.cachedAt)
-		req.Header.Set("If-None-Match", cachedData.etag)
+		headers.Set("If-Modified-Since", cachedData.cachedAt)
+		headers.Set("If-None-Match", cachedData.etag)
 	}
 
-	req.Header.Set("User-Agent", p.userAgent)
-	resp, err := http.DefaultClient.Do(req)
+	headers.Set("User-Agent", p.userAgent)
+	makeReq := func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlTarget, http.NoBody)
+		if err != nil {
+			return nil, err
+		}
+		req.Header = headers.Clone()
+		req.SetBasicAuth(p.login, p.password)
+		return req, nil
+	}
+	resp, err := p.do(ctx, makeReq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+
+	if resp == nil {
+		return nil, nil
+	}
+
+	defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
 	var datab []byte
 	if resp.StatusCode == http.StatusNotModified && cached {
 		datab = cachedData.data
-	} else if resp.StatusCode == http.StatusGone { // not found, to distinguish from reverse proxy 404 error
-		return nil, nil
-	} else if resp.StatusCode != http.StatusOK {
-		err = fmt.Errorf("HTTP error: %s", resp.Status) //nolint:goerr113 // that's ok
-		return nil, err
 	}
 
 	if datab == nil {
@@ -139,28 +190,25 @@ func (p *Client) GetRaw(ctx context.Context, identifier string, jobOverride ...s
 	uri := cloned.JoinPath("/" + job + "/" + identifier)
 	urlTarget := uri.String()
 
-	childCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(childCtx, http.MethodGet, urlTarget, http.NoBody)
+	headers := http.Header{}
+	headers.Set("User-Agent", p.userAgent)
+	makeReq := func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlTarget, http.NoBody)
+		if err != nil {
+			return nil, err
+		}
+		req.Header = headers.Clone()
+		req.SetBasicAuth(p.login, p.password)
+		return req, nil
+	}
+	resp, err := p.do(ctx, makeReq)
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(p.login, p.password)
-
-	req.Header.Set("User-Agent", p.userAgent)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusGone { // not found, to distinguish from reverse proxy 404 error
+	if resp == nil {
 		return nil, nil
-	} else if resp.StatusCode != http.StatusOK {
-		err = fmt.Errorf("HTTP error: %s", resp.Status) //nolint:goerr113 // that's ok
-		return nil, err
 	}
+	defer resp.Body.Close() //nolint:errcheck // it's defer, we don't care about the error here
 
 	return io.ReadAll(resp.Body)
 }
