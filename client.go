@@ -1,14 +1,17 @@
 package psd
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 )
@@ -18,11 +21,23 @@ const (
 	DefaultUserAgent = "Go-PSD-client/v0.0.0"
 	// DefaultMaxRetries is the default number of retries for failed requests
 	DefaultMaxRetries = 3
+	// DefaultMaxIdleConns is the maximum number of idle connections across all hosts.
+	DefaultMaxIdleConns = 256
+	// DefaultMaxIdleConnsPerHost is the maximum idle connections per host.
+	DefaultMaxIdleConnsPerHost = 256
+	// DefaultMaxConnsPerHost is the maximum total connections per host.
+	DefaultMaxConnsPerHost = 256
+	// DefaultIdleConnTimeout controls how long idle keep-alive connections stay around.
+	DefaultIdleConnTimeout = 90 * time.Second
 )
 
 // Client is the client to interact with the Prometheus Service Discovery HTTP API
 type Client struct {
 	url        *url.URL
+	baseURL    string
+	baseNode   string
+	baseHeader http.Header
+	basicAuth  string
 	cache      *expirable.LRU[string, cacheValue]
 	client     *http.Client
 	login      string
@@ -44,16 +59,41 @@ func NewClient(baseURL, login, password string, userAgentOverride ...string) *Cl
 		return &Client{client: http.DefaultClient}
 	}
 
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &Client{client: http.DefaultClient}
+	}
+	transport := defaultTransport.Clone()
+	transport.MaxIdleConns = DefaultMaxIdleConns
+	transport.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
+	transport.MaxConnsPerHost = DefaultMaxConnsPerHost
+	transport.IdleConnTimeout = DefaultIdleConnTimeout
+	transport.ForceAttemptHTTP2 = true
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 10 * time.Second
+	transport.ExpectContinueTimeout = 1 * time.Second
+
 	cache := expirable.NewLRU[string, cacheValue](1000, nil, 5*time.Minute)
 	userAgent := DefaultUserAgent
 	if len(userAgentOverride) > 0 {
 		userAgent = userAgentOverride[0]
 	}
 
+	baseHeader := make(http.Header, 4)
+	baseHeader.Set("Content-Type", "application/json")
+	baseHeader.Set("User-Agent", userAgent)
+	basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login+":"+password))
+	baseHeader.Set("Authorization", basicAuth)
+
+	baseURLStr := strings.TrimRight(uri.String(), "/")
 	return &Client{
 		url:        uri,
+		baseURL:    baseURLStr,
+		baseNode:   baseURLStr + "/node/",
+		baseHeader: baseHeader,
+		basicAuth:  basicAuth,
 		cache:      cache,
-		client:     http.DefaultClient,
+		client:     &http.Client{Transport: transport},
 		login:      login,
 		password:   password,
 		userAgent:  userAgent,
@@ -61,44 +101,81 @@ func NewClient(baseURL, login, password string, userAgentOverride ...string) *Cl
 	}
 }
 
+// buildURL constructs the URL for the given identifier and optional job override
+func (p *Client) buildURL(identifier string, jobOverride ...string) string {
+	if len(jobOverride) == 0 {
+		return p.baseNode + identifier
+	}
+	job := jobOverride[0]
+
+	var b strings.Builder
+	b.Grow(len(p.baseURL) + 1 + len(job) + 1 + len(identifier))
+	b.WriteString(p.baseURL)
+	b.WriteByte('/')
+	b.WriteString(job)
+	b.WriteByte('/')
+	b.WriteString(identifier)
+	return b.String()
+}
+
 // do executes an HTTP request with per-attempt timeout and retry handling.
-func (p *Client) do(ctx context.Context, makeReq func(context.Context) (*http.Request, error), currentAttempt ...int) (*http.Response, error) {
+// It returns a cancel func that must be called after the response body is fully consumed.
+func (p *Client) do(ctx context.Context, uri string, cached *cacheValue, currentAttempt ...int) (*http.Response, func(), error) {
 	attempt := 0
 	if len(currentAttempt) > 0 {
 		attempt = currentAttempt[0]
 	}
 
-	childCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	req, err := makeReq(childCtx)
-	if err != nil {
-		return nil, err
+	headers := p.baseHeader.Clone()
+	if cached != nil {
+		headers.Set("If-Modified-Since", cached.cachedAt)
+		headers.Set("If-None-Match", cached.etag)
 	}
+	childCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if _, ok := ctx.Deadline(); ok {
+		cancel()
+		childCtx = ctx
+		cancel = func() {}
+	}
+
+	req, err := http.NewRequestWithContext(childCtx, http.MethodGet, uri, http.NoBody)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	req.Header = headers
 
 	resp, err := p.client.Do(req) //nolint:gosec // The URL is built from a trusted source
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, nil
-		}
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 
 	if resp.StatusCode == http.StatusGone { // not found, to distinguish from reverse proxy 404 error
 		defer resp.Body.Close()
-		return nil, nil
+		cancel()
+		return nil, nil, nil
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotModified {
 		defer resp.Body.Close()
 		if attempt < p.maxRetries {
-			time.Sleep(1 * time.Second * time.Duration(attempt+1)) // Exponential backoff
-			return p.do(ctx, makeReq, attempt+1)
+			wait := 1 * time.Second * time.Duration(attempt+1)
+			cancel()
+			select {
+			case <-time.After(wait): // Exponential backoff
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			return p.do(ctx, uri, cached, attempt+1)
 		}
+
 		err = fmt.Errorf("HTTP error: %s", resp.Status)
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // GetWithContext returns the list of targets for the given identifier using the given context
@@ -106,32 +183,14 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 	if p.url == nil {
 		return nil, nil
 	}
-	cloned := *p.url
-	job := "node"
-	if len(jobOverride) > 0 {
-		job = jobOverride[0]
-	}
-	uri := cloned.JoinPath("/" + job + "/" + identifier)
-	urlTarget := uri.String()
+	urlTarget := p.buildURL(identifier, jobOverride...)
 	cachedData, cached := p.cache.Get(urlTarget)
-
-	headers := http.Header{}
+	var cachedPtr *cacheValue
 	if cached {
-		headers.Set("If-Modified-Since", cachedData.cachedAt)
-		headers.Set("If-None-Match", cachedData.etag)
+		cachedPtr = &cachedData
 	}
 
-	headers.Set("User-Agent", p.userAgent)
-	makeReq := func(ctx context.Context) (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlTarget, http.NoBody)
-		if err != nil {
-			return nil, err
-		}
-		req.Header = headers.Clone()
-		req.SetBasicAuth(p.login, p.password)
-		return req, nil
-	}
-	resp, err := p.do(ctx, makeReq)
+	resp, cancel, err := p.do(ctx, urlTarget, cachedPtr)
 	if err != nil {
 		return nil, err
 	}
@@ -141,26 +200,10 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 	}
 
 	defer resp.Body.Close()
-	var datab []byte
-	if resp.StatusCode == http.StatusNotModified && cached {
-		datab = cachedData.data
-	}
-
-	if datab == nil {
-		datab, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		lastModified := resp.Header.Get("Last-Modified")
-		if lastModified == "" {
-			lastModified = time.Now().Format(http.TimeFormat)
-		}
-		p.cache.Add(urlTarget, cacheValue{
-			data:     datab,
-			etag:     resp.Header.Get("ETag"),
-			cachedAt: lastModified,
-		})
+	defer cancel()
+	datab, err := p.responseData(resp, cached, cachedData, urlTarget)
+	if err != nil {
+		return nil, err
 	}
 	var psd []*Item
 	err = json.Unmarshal(datab, &psd)
@@ -169,6 +212,43 @@ func (p *Client) GetWithContext(ctx context.Context, identifier string, jobOverr
 	}
 
 	return psd, nil
+}
+
+func (p *Client) responseData(resp *http.Response, cached bool, cachedData cacheValue, urlTarget string) ([]byte, error) {
+	if resp.StatusCode == http.StatusNotModified && cached {
+		return cachedData.data, nil
+	}
+
+	datab, err := readBody(resp.Body, resp.ContentLength)
+	if err != nil {
+		return nil, err
+	}
+
+	lastModified := resp.Header.Get("Last-Modified")
+	if lastModified == "" {
+		lastModified = time.Now().Format(http.TimeFormat)
+	}
+	p.cache.Add(urlTarget, cacheValue{
+		data:     datab,
+		etag:     resp.Header.Get("ETag"),
+		cachedAt: lastModified,
+	})
+
+	return datab, nil
+}
+
+func readBody(r io.Reader, contentLength int64) ([]byte, error) {
+	if contentLength > 0 && contentLength <= int64(int(^uint(0)>>1)) {
+		var buf bytes.Buffer
+		buf.Grow(int(contentLength))
+		_, err := buf.ReadFrom(r)
+		if err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
+	return io.ReadAll(r)
 }
 
 // Get returns the list of targets for the given identifier
@@ -182,33 +262,17 @@ func (p *Client) GetRaw(ctx context.Context, identifier string, jobOverride ...s
 	if p.url == nil {
 		return nil, nil
 	}
-	cloned := *p.url
-	job := "node"
-	if len(jobOverride) > 0 {
-		job = jobOverride[0]
-	}
-	uri := cloned.JoinPath("/" + job + "/" + identifier)
-	urlTarget := uri.String()
-
-	headers := http.Header{}
-	headers.Set("User-Agent", p.userAgent)
-	makeReq := func(ctx context.Context) (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlTarget, http.NoBody)
-		if err != nil {
-			return nil, err
-		}
-		req.Header = headers.Clone()
-		req.SetBasicAuth(p.login, p.password)
-		return req, nil
-	}
-	resp, err := p.do(ctx, makeReq)
+	urlTarget := p.buildURL(identifier, jobOverride...)
+	resp, cancel, err := p.do(ctx, urlTarget, nil)
 	if err != nil {
 		return nil, err
 	}
+
 	if resp == nil {
 		return nil, nil
 	}
 	defer resp.Body.Close()
+	defer cancel()
 
-	return io.ReadAll(resp.Body)
+	return readBody(resp.Body, resp.ContentLength)
 }

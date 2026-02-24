@@ -1,14 +1,19 @@
 package psd
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 // Helper function to create mock data
@@ -21,6 +26,33 @@ func createMockData(t *testing.T) []byte {
 	data, err := json.Marshal(targets)
 	if err != nil {
 		t.Fatalf("Failed to marshal mock data: %v", err)
+	}
+	return data
+}
+
+func createBenchmarkData(b *testing.B) []byte {
+	b.Helper()
+	const itemsCount = 50
+	items := make([]*Item, 0, itemsCount)
+	for i := 0; i < itemsCount; i++ {
+		domain := fmt.Sprintf("example-%d.com", i)
+		items = append(items, &Item{
+			Targets: []string{
+				domain + ":443",
+				domain + ":8448",
+				domain + "/.well-known/matrix/client",
+				domain + "/_matrix/federation/v1/version",
+			},
+			Labels: map[string]string{
+				"domain": domain,
+				"site":   "bench",
+				"index":  strconv.Itoa(i),
+			},
+		})
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		b.Fatalf("Failed to marshal benchmark data: %v", err)
 	}
 	return data
 }
@@ -42,7 +74,23 @@ func TestNewClient(t *testing.T) {
 // Test GetWithContext with a valid response and cache miss
 func TestGetWithContext_CacheMiss(t *testing.T) {
 	mockData := createMockData(t)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Fatal("Expected User-Agent header to be set")
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "user" || pass != "password" {
+			t.Fatal("Expected Authorization header to be set with valid Basic Auth")
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Expected Content-Type application/json, got %q", got)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "" {
+			t.Fatalf("Expected no If-Modified-Since on cache miss, got %q", got)
+		}
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("Expected no If-None-Match on cache miss, got %q", got)
+		}
 		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
 		w.Header().Set("ETag", `"mock-etag"`)
 		w.WriteHeader(http.StatusOK)
@@ -76,6 +124,16 @@ func TestGetWithContext_CacheHit(t *testing.T) {
 
 	// Create a test server that will return a 304 Not Modified
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Fatal("Expected User-Agent header to be set")
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "user" || pass != "password" {
+			t.Fatal("Expected Authorization header to be set with valid Basic Auth")
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Expected Content-Type application/json, got %q", got)
+		}
 		if r.Header.Get("If-None-Match") == etag && r.Header.Get("If-Modified-Since") == lastModified {
 			w.WriteHeader(http.StatusNotModified)
 		} else {
@@ -162,6 +220,11 @@ func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
 				headerErr.Store("User-Agent mismatch: got " + got + ", want " + userAgent)
 			}
 		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			if headerErr.Load() == nil {
+				headerErr.Store("Content-Type mismatch: got " + got + ", want application/json")
+			}
+		}
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != "user" || pass != "password" {
 			if headerErr.Load() == nil {
@@ -216,4 +279,191 @@ func TestGetWithContext_RetryLimitExceeded(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != int32(client.maxRetries)+1 {
 		t.Fatalf("Expected %d calls, got %d", client.maxRetries+1, got)
 	}
+}
+
+func TestGetWithContext_ContextCanceledReturnsError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Fatal("Expected User-Agent header to be set")
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "user" || pass != "password" {
+			t.Fatal("Expected Authorization header to be set with valid Basic Auth")
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Expected Content-Type application/json, got %q", got)
+		}
+		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
+		w.Header().Set("ETag", `"mock-etag"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write(createMockData(t))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetWithContext(ctx, "test-id")
+	if err == nil {
+		t.Fatal("Expected error for canceled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Expected context.Canceled, got %v", err)
+	}
+}
+
+func TestGetWithContext_ConcurrentRequestsNoCancellation(t *testing.T) {
+	mockData := createMockData(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Error("Expected User-Agent header to be set")
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "user" || pass != "password" {
+			t.Error("Expected Authorization header to be set with valid Basic Auth")
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Expected Content-Type application/json, got %q", got)
+		}
+		w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
+		w.Header().Set("ETag", `"mock-etag"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write(mockData)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	const total = 100
+	var wg sync.WaitGroup
+	errCh := make(chan error, total)
+
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := "test-id-" + strconv.Itoa(i)
+			_, err := client.GetWithContext(context.Background(), id)
+			errCh <- err
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Expected no errors, got %v", err)
+		}
+	}
+}
+
+func BenchmarkGetWithContext_Parallel(b *testing.B) {
+	payload := createBenchmarkData(b)
+	lastModified := "Mon, 02 Jan 2006 15:04:05 GMT"
+	etag := `"mock-etag"`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Last-Modified", lastModified)
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusOK)
+		w.Write(payload)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	var total uint64
+	var errVal atomic.Value
+	var errOnce sync.Once
+	var failed atomic.Bool
+	ctx := context.Background()
+	id := "bench-id"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			if failed.Load() {
+				break
+			}
+			_, err := client.GetWithContext(ctx, id)
+			if err != nil {
+				errOnce.Do(func() {
+					errVal.Store(fmt.Errorf("request error: %T: %w", err, err))
+				})
+				failed.Store(true)
+				break
+			}
+			local++
+		}
+		if local > 0 {
+			atomic.AddUint64(&total, local)
+		}
+	})
+	elapsed := time.Since(start)
+
+	if err := errVal.Load(); err != nil {
+		b.Fatalf("Benchmark failed: %v", err)
+	}
+
+	rps := float64(total) / elapsed.Seconds()
+	b.ReportMetric(rps, "req/s")
+}
+
+func BenchmarkGetRaw_Parallel(b *testing.B) {
+	payload := createBenchmarkData(b)
+	lastModified := "Mon, 02 Jan 2006 15:04:05 GMT"
+	etag := `"mock-etag"`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Last-Modified", lastModified)
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusOK)
+		w.Write(payload)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	var total uint64
+	var errVal atomic.Value
+	var errOnce sync.Once
+	var failed atomic.Bool
+	ctx := context.Background()
+	id := "bench-id"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			if failed.Load() {
+				break
+			}
+			_, err := client.GetRaw(ctx, id)
+			if err != nil {
+				errOnce.Do(func() {
+					errVal.Store(fmt.Errorf("request error: %T: %w", err, err))
+				})
+				failed.Store(true)
+				break
+			}
+			local++
+		}
+		if local > 0 {
+			atomic.AddUint64(&total, local)
+		}
+	})
+	elapsed := time.Since(start)
+
+	if err := errVal.Load(); err != nil {
+		b.Fatalf("Benchmark failed: %v", err)
+	}
+
+	rps := float64(total) / elapsed.Seconds()
+	b.ReportMetric(rps, "req/s")
 }
