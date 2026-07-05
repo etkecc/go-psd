@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -245,7 +246,6 @@ func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
 	defer ts.Close()
 
 	client := NewClient(ts.URL, "user", "password", userAgent)
-	client.maxRetries = int(failUntil)
 
 	_, err := client.Get("test-id")
 	if err != nil {
@@ -259,25 +259,82 @@ func TestGetWithContext_RetriesAndPreservesHeadersAndAuth(t *testing.T) {
 	}
 }
 
-func TestGetWithContext_RetryLimitExceeded(t *testing.T) {
+func TestGetWithContext_RetriesExhausted(t *testing.T) {
 	var calls int32
-	userAgent := "test-ua"
-
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "user", "password", userAgent)
-	client.maxRetries = 1
+	client := NewClient(ts.URL, "user", "password")
 
 	_, err := client.Get("test-id")
 	if err == nil || !strings.Contains(err.Error(), "HTTP error: 500 Internal Server Error") {
 		t.Fatalf("Expected HTTP 500 error after retries, got %v", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != int32(client.maxRetries)+1 {
-		t.Fatalf("Expected %d calls, got %d", client.maxRetries+1, got)
+	// >=2 proves retries fired without coupling the assertion to httpclient's internal count.
+	if got := atomic.LoadInt32(&calls); got < 2 {
+		t.Fatalf("Expected at least 2 attempts (retries fired), got %d", got)
+	}
+}
+
+func TestGetWithContext_FailsFastOn4xx(t *testing.T) {
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	_, err := client.Get("test-id")
+	if err == nil || !strings.Contains(err.Error(), "HTTP error: 401 Unauthorized") {
+		t.Fatalf("Expected HTTP 401 error, got %v", err)
+	}
+	// exactly 1: a 4xx other than 429 is terminal, no retry. this is the whole 4xx behavior proof.
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("Expected exactly 1 attempt on 4xx, got %d", got)
+	}
+}
+
+func TestGetWithContext_NoConnLeakUnder5xx(t *testing.T) {
+	var newConns int32
+	var failing atomic.Bool
+	failing.Store(true)
+
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("ETag", `"mock-etag"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write(createMockData(t))
+	}))
+	ts.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			atomic.AddInt32(&newConns, 1)
+		}
+	}
+	ts.Start()
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "user", "password")
+
+	// first call exhausts retries on 500 and errors; psd must drain the terminal body so the
+	// connection returns to the pool instead of leaking.
+	if _, err := client.Get("test-id"); err == nil {
+		t.Fatal("Expected error on persistent 500")
+	}
+	// second call succeeds and must reuse the pooled connection, not open a fresh one.
+	failing.Store(false)
+	if _, err := client.Get("test-id-2"); err != nil {
+		t.Fatalf("Expected success on second call, got %v", err)
+	}
+	if got := atomic.LoadInt32(&newConns); got != 1 {
+		t.Fatalf("Expected 1 connection reused across both calls (drained body returned to pool), got %d", got)
 	}
 }
 

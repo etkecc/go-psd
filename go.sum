@@ -1,3 +1,5 @@
+github.com/etkecc/go-kit v1.12.1 h1:fnC7KfTOlpspaBZYipOJPTSVPWhZvTx/wrf6UNKLORA=
+github.com/etkecc/go-kit v1.12.1/go.mod h1:Mj5wxe1ntD+yxAxxozIb/F9ns4sLEeRTzHjFiNdNP9g=
 github.com/goccy/go-json v0.10.5 h1:Fq85nIqj+gXn/S5ahsiTlK3TmC85qgirsdTP/+DeaC4=
 github.com/goccy/go-json v0.10.5/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
